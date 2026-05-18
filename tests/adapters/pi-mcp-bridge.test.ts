@@ -25,6 +25,7 @@ import "../setup-home";
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -157,12 +158,96 @@ describe("bootstrapMCPTools — no JS runtime + execPath is pi (#516)", () => {
   });
 });
 
-// Slice 5 — respawn after idle self-shutdown (#583)
+// Slice 5 — broken-pipe hardening during stdio writes
 //
-// Regression: in v1.0.132 the MCP server gained an idle self-shutdown
-// (#565/#568, lifecycle.ts). When the Pi-spawned child exits cleanly
-// after CONTEXT_MODE_IDLE_TIMEOUT_MS of inactivity, Pi keeps the
-// previously-registered tool handles, but the bridge client has
+// Regression: if the MCP child closed its stdin after replying to
+// initialize but before the bridge sent notifications/initialized,
+// notify() could throw `write EPIPE` synchronously. Because initialize()
+// calls notify() after the awaited request resolves, that exception
+// escaped as a Pi-level uncaughtException and terminated the session.
+describe("MCPStdioClient — handles EPIPE when writing to child stdin", () => {
+  it("does not throw when an initialize notification hits a broken pipe", async () => {
+    const { MCPStdioClient } = await import("../../src/adapters/pi/mcp-bridge.js");
+    const client = new MCPStdioClient("/unused/server.mjs");
+    const epipe = Object.assign(new Error("write EPIPE"), {
+      code: "EPIPE",
+      errno: -32,
+      syscall: "write",
+    });
+
+    (client as unknown as { child: unknown }).child = {
+      stdin: {
+        destroyed: false,
+        writableEnded: false,
+        closed: false,
+        write: () => {
+          throw epipe;
+        },
+      },
+    };
+
+    expect(() => client.notify("notifications/initialized", {})).not.toThrow();
+    expect((client as unknown as { exited: boolean }).exited).toBe(true);
+  });
+
+  it("rejects a request instead of throwing when the write hits a broken pipe", async () => {
+    const { MCPStdioClient } = await import("../../src/adapters/pi/mcp-bridge.js");
+    const client = new MCPStdioClient("/unused/server.mjs");
+    const epipe = Object.assign(new Error("write EPIPE"), {
+      code: "EPIPE",
+      errno: -32,
+      syscall: "write",
+    });
+
+    (client as unknown as { child: unknown }).child = {
+      stdin: {
+        destroyed: false,
+        writableEnded: false,
+        closed: false,
+        write: () => {
+          throw epipe;
+        },
+      },
+    };
+
+    await expect(client.request("tools/list", {}, 100)).rejects.toThrow(
+      "MCP server exited",
+    );
+    expect((client as unknown as { exited: boolean }).exited).toBe(true);
+  });
+
+  it("rejects async stdin write callback errors without process-level uncaught exceptions", async () => {
+    const { MCPStdioClient } = await import("../../src/adapters/pi/mcp-bridge.js");
+    const client = new MCPStdioClient("/unused/server.mjs");
+    const stdin = new EventEmitter() as EventEmitter & {
+      destroyed: boolean;
+      writableEnded: boolean;
+      closed: boolean;
+      write: (_data: string, cb: (err?: NodeJS.ErrnoException) => void) => boolean;
+    };
+    stdin.destroyed = false;
+    stdin.writableEnded = false;
+    stdin.closed = false;
+    stdin.write = (_data, cb) => {
+      queueMicrotask(() => {
+        cb(Object.assign(new Error("write EPIPE"), { code: "EPIPE" }));
+      });
+      return false;
+    };
+
+    (client as unknown as { child: unknown }).child = { stdin };
+
+    await expect(client.request("tools/list", {}, 100)).rejects.toThrow(
+      "MCP server exited",
+    );
+    expect((client as unknown as { exited: boolean }).exited).toBe(true);
+  });
+});
+
+// Slice 6 — respawn after MCP child exit (#583)
+//
+// Regression: when the Pi-spawned child exits cleanly while Pi keeps the
+// previously-registered tool handles, the bridge client has
 // `exited=true` and every subsequent request rejects with
 // "MCP server has exited". The user sees a permanently broken set of
 // `ctx_*` tools until they restart Pi.
@@ -170,12 +255,11 @@ describe("bootstrapMCPTools — no JS runtime + execPath is pi (#516)", () => {
 // Fix: when `callTool()` is invoked on an exited client, respawn the
 // MCP child + re-`initialize()` transparently before issuing the call,
 // so already-registered Pi tools recover on the very next use.
-describe("MCPStdioClient — respawns after idle self-shutdown (#583)", () => {
+describe("MCPStdioClient — respawns after MCP child exit (#583)", () => {
   it("re-spawns the child when callTool is invoked after exit, and the call succeeds", async () => {
     // Fake MCP server: handles initialize, tools/list, tools/call.
     // On its FIRST process incarnation it exits cleanly after the first
-    // tools/call — mirroring lifecycle.ts gracefulShutdown(0) firing on
-    // idle. A marker file on disk distinguishes the original child from
+    // tools/call — mirroring a clean MCP child shutdown. A marker file on disk distinguishes the original child from
     // the respawned one so the second incarnation stays alive.
     const markerPath = join(scratch, "first-incarnation-marker");
     const fakePath = join(scratch, "exit-after-call.mjs");
@@ -203,7 +287,7 @@ describe("MCPStdioClient — respawns after idle self-shutdown (#583)", () => {
           } else if (msg.method === "tools/call") {
             callCount++;
             process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: "pong-pid-" + process.pid }] } }) + "\\n");
-            // First incarnation: mimic idle self-shutdown after one call.
+            // First incarnation: mimic clean MCP child shutdown after one call.
             if (isFirst && callCount === 1) {
               writeFileSync(MARKER, "1");
               setTimeout(() => process.exit(0), 10);
