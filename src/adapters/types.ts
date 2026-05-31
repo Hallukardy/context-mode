@@ -15,6 +15,8 @@
 // Hook paradigm
 // ─────────────────────────────────────────────────────────
 
+import { resolveHookRuntime } from "../runtime.js";
+
 export type HookParadigm = "json-stdio" | "ts-plugin" | "mcp-only";
 
 // ─────────────────────────────────────────────────────────
@@ -385,6 +387,46 @@ export function buildNodeCommand(
   }
   const safePath = scriptPath.replace(/\\/g, "/");
   return `"${nodePath}" "${safePath}"`;
+}
+
+/**
+ * Build a cross-platform hook spawn command using the resolved JS runtime
+ * (issue #738). Identical wire-format to {@link buildNodeCommand} — two
+ * double-quoted, forward-slashed tokens separated by whitespace — so it
+ * round-trips through {@link parseNodeCommand} unchanged.
+ *
+ * The only difference is the runtime path: when a Bun ≥1.0 install is
+ * detected at process start, that path is used in place of `process.execPath`.
+ * Hooks run end-to-end in pure JS (no native modules) so swapping the
+ * runtime is a no-op for output but cuts ~40-60ms of Node cold-start per
+ * tool call.
+ *
+ * Why a SEPARATE helper instead of repurposing {@link buildNodeCommand}:
+ *   `buildNodeCommand` is also called by openclaw plugin (doctor / upgrade
+ *   command suggestions in `src/adapters/openclaw/plugin.ts`). Those CLI
+ *   targets MUST stay on Node because they load better-sqlite3, which has
+ *   no Bun-compatible prebuild yet (#543). Keeping the two helpers separate
+ *   makes the audit trivial: anything emitting a hook spawn command uses
+ *   `buildHookRuntimeCommand`; anything emitting a user-visible CLI command
+ *   stays on `buildNodeCommand`.
+ *
+ * `opts.platform` is forwarded to {@link isInProcessPluginPlatform} so the
+ * existing opencode/kilo in-process JS-runtime substitution still works
+ * (those platforms inject their own runtime via `opts.jsRuntime`).
+ */
+export function buildHookRuntimeCommand(
+  scriptPath: string,
+  opts?: { platform?: string; jsRuntime?: string },
+): string {
+  // In-process plugin platforms (opencode/kilo) inject their own runtime —
+  // delegate to buildNodeCommand which already handles that special case.
+  if (isInProcessPluginPlatform(opts?.platform)) {
+    return buildNodeCommand(scriptPath, opts);
+  }
+  const runtime = resolveHookRuntime();
+  const runtimePath = runtime.path.replace(/\\/g, "/");
+  const safePath = scriptPath.replace(/\\/g, "/");
+  return `"${runtimePath}" "${safePath}"`;
 }
 
 /**

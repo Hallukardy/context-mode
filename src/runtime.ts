@@ -342,6 +342,128 @@ export function hasBunRuntime(): boolean {
   return bunExists();
 }
 
+/**
+ * Resolved JS runtime for hook spawn commands. `path` is the absolute (or
+ * bare-name on POSIX where PATH resolution is reliable) binary path.
+ * `isBun` is true only when we successfully probed a Bun ≥1.0 install.
+ */
+export interface HookRuntime {
+  readonly path: string;
+  readonly isBun: boolean;
+}
+
+/**
+ * Cached result of {@link resolveHookRuntime}. Populated on first call so the
+ * relatively expensive `bun --version` probe runs at most once per process.
+ * Reset via {@link resetHookRuntimeCache} (test-only).
+ */
+let _hookRuntimeCache: HookRuntime | null = null;
+
+/**
+ * Reset the hook-runtime resolution cache. Test-only — production code
+ * should never call this. Vitest mocks `node:child_process`/`node:fs`
+ * per-test, so the per-process cache from a previous test would otherwise
+ * mask the mock and yield the host's real bun/node detection result.
+ */
+export function resetHookRuntimeCache(): void {
+  _hookRuntimeCache = null;
+}
+
+/**
+ * Parse a `bun --version` stdout string and return true when the version is
+ * ≥1.0.0. Anything that doesn't match `MAJOR.MINOR.PATCH` (with optional
+ * pre-release suffix) returns false — we refuse to trust runtimes whose
+ * version we can't read because the failure mode is silent miscompare
+ * (e.g. a banner line getting interpreted as "0.0.0").
+ */
+function bunVersionAtLeast1(versionOutput: string): boolean {
+  const trimmed = versionOutput.trim();
+  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(trimmed);
+  if (!m) return false;
+  const major = Number(m[1]);
+  return Number.isFinite(major) && major >= 1;
+}
+
+/**
+ * Resolve the JS runtime to use for spawning hook scripts (issue #738).
+ *
+ * Returns Bun when:
+ *   - a bun binary is located via {@link bunCommand} (already handles the
+ *     Windows .cmd shim trap from #506 + absolute path fallbacks), AND
+ *   - `bun --version` exits 0 within the probe timeout, AND
+ *   - the reported semver major is ≥1.
+ *
+ * Returns Node (`process.execPath`) on every other path — missing bun,
+ * version probe failure, version <1, malformed version banner. Silent
+ * fallback: never throws, never logs to stderr (a noisy log would clutter
+ * the same MCP boot output that #719 tightened up).
+ *
+ * Result is cached at module load so the cost is amortised across every
+ * hook command emission for the lifetime of the process. The cache also
+ * keeps the behaviour deterministic — if the user `brew uninstall bun`
+ * mid-session, the cached resolution stays valid for that session and the
+ * next MCP boot re-detects.
+ *
+ * Why bun ≥1.0 instead of "any bun":
+ *   - Bun 0.x had multiple ESM/module-resolution regressions that broke
+ *     dynamic `import()` inside hooks (and our hooks do ~7 dynamic imports
+ *     in `pretooluse.mjs`).
+ *   - 1.0 ships stable npm-compat that our better-sqlite3-adjacent code
+ *     relies on indirectly (hooks share `ensure-deps.mjs` which is
+ *     bun-safe past 1.0 but not 0.x).
+ *
+ * NOT used by:
+ *   - `buildNodeCommand` — kept on `process.execPath` for openclaw doctor /
+ *     upgrade hints which must invoke the better-sqlite3-loading CLI on
+ *     Node (#543: bun cannot dlopen better-sqlite3's prebuilt .node).
+ *   - `ensure-deps.mjs` — separate path, must stay on Node for the same
+ *     reason.
+ *   - `ctx_upgrade` — separate path, must stay on Node for the same reason.
+ */
+export function resolveHookRuntime(): HookRuntime {
+  if (_hookRuntimeCache) return _hookRuntimeCache;
+  const nodeFallback: HookRuntime = { path: process.execPath, isBun: false };
+  try {
+    if (!bunExists()) {
+      _hookRuntimeCache = nodeFallback;
+      return _hookRuntimeCache;
+    }
+    const bun = bunCommand();
+    // Re-use the same probe shape as getVersion (POSIX execFile, Windows
+    // execSync quoted string for DEP0190 compliance).
+    let versionOutput: string;
+    try {
+      if (process.platform === "win32") {
+        const out = execSync(`"${bun}" --version`, {
+          encoding: "utf-8",
+          stdio: ["pipe", "pipe", "pipe"],
+          timeout: 5000,
+        });
+        versionOutput = String(out);
+      } else {
+        const out = execFileSync(bun, ["--version"], {
+          encoding: "utf-8",
+          stdio: ["pipe", "pipe", "pipe"],
+          timeout: 5000,
+        });
+        versionOutput = String(out);
+      }
+    } catch {
+      _hookRuntimeCache = nodeFallback;
+      return _hookRuntimeCache;
+    }
+    if (!bunVersionAtLeast1(versionOutput)) {
+      _hookRuntimeCache = nodeFallback;
+      return _hookRuntimeCache;
+    }
+    _hookRuntimeCache = { path: bun, isBun: true };
+    return _hookRuntimeCache;
+  } catch {
+    _hookRuntimeCache = nodeFallback;
+    return _hookRuntimeCache;
+  }
+}
+
 export function getRuntimeSummary(runtimes: RuntimeMap): string {
   const lines: string[] = [];
   const bunPreferred = runtimes.javascript?.endsWith("bun") ?? false;
