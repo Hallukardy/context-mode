@@ -31,17 +31,26 @@ describe("resolveHookRuntime — auto-detect bun ≥1.0, fall back to node (#738
 
   test("returns bun path + isBun=true when bun ≥1.0 is available", async () => {
     // bunCommand() resolves to either:
-    //   1) the first existing path in bunFallbackPaths() (~/.bun/bin/bun on Unix), OR
+    //   1) the first existing path in bunFallbackPaths() (~/.bun/bin/bun on Unix,
+    //      %USERPROFILE%\.bun\bin\bun.exe + %LOCALAPPDATA% paths on Windows), OR
     //   2) the literal "bun" string when commandExists("bun") succeeds.
-    // We exercise branch (1) by stubbing HOME to a known directory and
-    // claiming only "$HOME/.bun/bin/bun" exists.
-    const fakeHome = "/fake/home/for-738-test";
-    const fakeBun = `${fakeHome}/.bun/bin/bun`;
+    // We exercise branch (1) by stubbing HOME (or USERPROFILE on Windows) to a
+    // known directory and claiming only the bun candidate path exists. The
+    // existsSync mock accepts either separator + a `.exe` suffix so the same
+    // test exercises both code paths.
+    const isWin = process.platform === "win32";
+    const fakeHome = isWin ? "C:\\fake\\home\\for-738-test" : "/fake/home/for-738-test";
+    const fakeBun = isWin
+      ? `${fakeHome}\\.bun\\bin\\bun.exe`
+      : `${fakeHome}/.bun/bin/bun`;
     const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
     process.env.HOME = fakeHome;
+    if (isWin) process.env.USERPROFILE = fakeHome;
     try {
       const execSync = vi.fn((cmd: string) => {
-        if (/^command -v\s+bun$/.test(cmd)) return `${fakeBun}\n`;
+        // POSIX probe: `command -v bun`. Windows probe: `where bun`.
+        if (/^(command -v|where)\s+bun$/.test(cmd)) return `${fakeBun}\n`;
         return "";
       });
       const execFileSync = vi.fn((cmd: string, args: string[]) => {
@@ -55,7 +64,12 @@ describe("resolveHookRuntime — auto-detect bun ≥1.0, fall back to node (#738
         const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
         return {
           ...actual,
-          existsSync: (p: string | URL) => String(p) === fakeBun,
+          // Accept either-separator form so the test passes regardless of
+          // whether bunFallbackPaths() emits forward or backward slashes.
+          existsSync: (p: string | URL) => {
+            const s = String(p).replace(/\\/g, "/");
+            return s === fakeBun.replace(/\\/g, "/");
+          },
         };
       });
 
@@ -63,10 +77,16 @@ describe("resolveHookRuntime — auto-detect bun ≥1.0, fall back to node (#738
       resetHookRuntimeCache();
       const r = resolveHookRuntime();
       expect(r.isBun).toBe(true);
-      expect(r.path).toBe(fakeBun);
+      // path may come back with native separators on Windows — normalize both
+      // sides for the assertion.
+      expect(r.path.replace(/\\/g, "/")).toBe(fakeBun.replace(/\\/g, "/"));
     } finally {
       if (originalHome === undefined) delete process.env.HOME;
       else process.env.HOME = originalHome;
+      if (isWin) {
+        if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = originalUserProfile;
+      }
     }
   });
 

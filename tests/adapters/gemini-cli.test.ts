@@ -306,7 +306,10 @@ describe("GeminiCLIAdapter", () => {
         // command points to must exist in the same tree the doctor inspects.
         const expectedPath = join(repoRoot, "hooks", "gemini-cli", scriptName);
         expect(existsSync(expectedPath), `missing ${expectedPath}`).toBe(true);
-        expect(cmd).toContain(expectedPath);
+        // buildHookRuntimeCommand emits forward-slash paths on every OS
+        // (MSYS / Git Bash on Windows uses forward slashes). path.join on
+        // Windows returns backslashes, so normalize before substring-match.
+        expect(cmd).toContain(expectedPath.replace(/\\/g, "/"));
       }
     });
 

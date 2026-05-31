@@ -824,7 +824,11 @@ describe("detectRuntimes — JS runtime fallback for in-process plugin hosts (#7
     stubExecPath("/usr/local/bin/opencode");
 
     const execSync = vi.fn((cmd: string) => {
+      // commandExists uses `where <name>` on win32, `command -v <name>` elsewhere.
+      // Mock BOTH probe shapes so the test exercises the same fallback path on
+      // every CI runner (the test name says "cross-OS, not Windows-only").
       if (cmd === "where bun") throw new Error("bun not found");
+      if (cmd === "where node") return "C:\\Program Files\\nodejs\\node.exe\n";
       if (cmd === "command -v node") return "/usr/local/bin/node\n";
       if (/^where\s/.test(cmd)) throw new Error("not found");
       if (/^command -v\s/.test(cmd)) throw new Error("not found");
