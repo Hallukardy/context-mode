@@ -93,7 +93,7 @@ All checks should show `[x]`. The doctor validates runtimes, hooks, FTS5, and pl
 | `/context-mode:ctx-search` | Search previously indexed content. |
 | `/context-mode:ctx-upgrade` | Pull latest, rebuild, migrate cache, fix hooks. |
 | `/context-mode:ctx-purge` | Permanently delete all indexed content from the knowledge base. |
-| `/context-mode:ctx-insight` | Personal analytics dashboard — 90 metrics, 37 insight patterns, 4 composite scores (productivity, quality, delegation, context health) across 23 event categories. Opens a local web UI. |
+| `/context-mode:ctx-insight` | Opens the hosted Insight dashboard ([context-mode.com/insight](https://context-mode.com/insight)) in your browser — org analytics for AI-assisted engineering teams. Sign in at platform.context-mode.com. |
 
 > **Note:** Slash commands are a Claude Code plugin feature. On other platforms, type `ctx stats`, `ctx doctor`, `ctx index`, `ctx search`, `ctx upgrade`, or `ctx insight` in the chat — the model calls the MCP tool automatically. See [Utility Commands](#utility-commands).
 
@@ -323,7 +323,7 @@ After Cursor lists context-mode in the [Marketplace](https://cursor.com/marketpl
 git clone https://github.com/mksglu/context-mode.git
 cd context-mode
 robocopy . "$env:USERPROFILE\.cursor\plugins\local\context-mode" /MIR `
-  /XD node_modules .git build insight web tests scripts .vscode `
+  /XD node_modules .git build web tests scripts .vscode `
   /XF *.log .gitignore *.bundle.mjs.map
 ```
 
@@ -1336,7 +1336,7 @@ ctx index       → index a local file or directory for later search
 ctx search      → search previously indexed content
 ctx upgrade     → update from GitHub, rebuild, reconfigure hooks
 ctx purge       → permanently delete all indexed content from the knowledge base
-ctx insight     → personal analytics dashboard (opens local web UI)
+ctx insight     → opens the hosted Insight dashboard in your browser
 ```
 
 **From your terminal** — run directly without an AI session:
@@ -1346,7 +1346,7 @@ context-mode doctor
 context-mode index . --source project:my-app
 context-mode search "authentication middleware" --source project:my-app
 context-mode upgrade
-context-mode insight          # opens analytics dashboard in browser
+context-mode insight          # opens the hosted Insight dashboard in browser
 bash scripts/ctx-debug.sh    # full diagnostic report for bug reports
 ```
 

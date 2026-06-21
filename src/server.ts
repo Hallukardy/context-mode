@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createRequire } from "node:module";
 import { existsSync, unlinkSync, readdirSync, readFileSync, writeFileSync, writeSync, renameSync, rmSync, mkdirSync, cpSync, statSync, symlinkSync, lstatSync, realpathSync } from "node:fs";
-import { execSync, spawnSync, type ChildProcess, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
+import { spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
 import { join, dirname, resolve, sep, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir, cpus, platform } from "node:os";
@@ -454,10 +454,6 @@ function maybeIndexSessionEvents(store: ContentStore): void {
 // hardcoded configDir detection in tool handlers.
 
 let _detectedAdapter: HookAdapter | null = null;
-
-// Tracks the ctx_insight dashboard child so shutdown can terminate it.
-// See ctx_insight handler + shutdown() in main().
-let _insightChild: ChildProcess | null = null;
 
 /**
  * Resolve the Claude Code config root, honoring `CLAUDE_CONFIG_DIR` (incl.
@@ -4058,7 +4054,9 @@ server.registerTool(
     const bundlePath = resolve(pluginRoot, "cli.bundle.mjs");
     const fallbackPath = resolve(pluginRoot, "build", "cli.js");
 
-    // Clean up insight-cache on upgrade so next ctx_insight does fresh build
+    // Insight pivoted to the hosted dashboard (context-mode.com/insight), so
+    // ctx_insight no longer builds a local cache. On upgrade, sweep the legacy
+    // insight-cache and stop any stale local dashboard left from old versions.
     try {
       const sessDir = getSessionDir();
       const insightCacheDir = join(dirname(sessDir), "insight-cache");
@@ -4537,259 +4535,33 @@ export function killProcessOnPort(
   return result;
 }
 
-// ── ctx-insight: analytics dashboard ──────────────────────────────────────────
+// ── ctx-insight: open the hosted Insight dashboard ───────────────────────────
+// Insight pivoted from a locally-built dashboard to the hosted B2B product at
+// context-mode.com/insight (org analytics; sign-in at platform.context-mode.com).
+// The tool now simply opens that URL in the user default browser via the same
+// cross-platform helper (openBrowserSync) used elsewhere.
+const INSIGHT_URL = "https://context-mode.com/insight";
+
 server.registerTool(
   "ctx_insight",
   {
     title: "Open Insight Dashboard",
     description:
-      "Opens the context-mode Insight dashboard in the browser — a dashboard launcher for session analytics; for natural-language queries over indexed content, use ctx_search. " +
-      "Shows personal analytics: session activity, tool usage, error rate, " +
-      "parallel work patterns, project focus, and actionable insights. " +
-      "First run installs dependencies (~30s). Subsequent runs open instantly. " +
-      "Defaults to port 4747; pass `port` to override. " +
-      "`sessionDir` and `contentDir` override the session/content storage roots " +
-      "(env aliases INSIGHT_SESSION_DIR / INSIGHT_CONTENT_DIR) for diagnosing " +
-      "multi-install setups or pointing at a sibling project's data.",
-    inputSchema: z.object({
-      port: z.coerce.number().int().min(1).max(65535).optional().describe("Port to serve on (default: 4747)"),
-      sessionDir: z.string().optional().describe("Override INSIGHT_SESSION_DIR: directory containing context-mode session .db files"),
-      contentDir: z.string().optional().describe("Override INSIGHT_CONTENT_DIR: directory containing context-mode content/index .db files"),
-      insightSessionDir: z.string().optional().describe("Alias for sessionDir / INSIGHT_SESSION_DIR"),
-      insightContentDir: z.string().optional().describe("Alias for contentDir / INSIGHT_CONTENT_DIR"),
-    }),
+      "Opens the context-mode Insight dashboard (https://context-mode.com/insight) in your " +
+      "default browser — a dashboard launcher for the hosted analytics layer, not a Q&A engine. " +
+      "Insight surfaces per-engineer productive rate, retry waste, blocker detection, and " +
+      "role-narrowed views for CTO, EM, IC, CISO, FinOps, and DevOps; sign in at " +
+      "platform.context-mode.com. For natural-language queries over your indexed content, use ctx_search.",
+    inputSchema: z.object({}),
   },
-  async ({ port: userPort, sessionDir, contentDir, insightSessionDir, insightContentDir }) => {
-    const port = userPort || 4747;
-    const explicitSessionDir = sessionDir || insightSessionDir;
-    const explicitContentDir = contentDir || insightContentDir;
-    // __pkg_dir is build/ for tsc, plugin root for bundle — resolve to plugin root
-    const pluginRoot = getPackageRoot();
-    const insightSource = resolve(pluginRoot, "insight");
-    // Use adapter-aware path by default, but allow MCP callers to pass explicit
-    // Insight data dirs for hosts whose adapter/default detection is unavailable.
-    const sessDir = explicitSessionDir ? resolve(explicitSessionDir) : getSessionDir();
-    const insightContentDirResolved = explicitContentDir ? resolve(explicitContentDir) : join(dirname(sessDir), "content");
-    const cacheDir = join(dirname(sessDir), "insight-cache");
-
-    // Confused-deputy guard on explicit overrides. The spawned insight
-    // server reads every .db file under sessDir and insightContentDir, and
-    // its /api/content DELETE endpoint can rewrite hex-named .db files in
-    // those trees. A prompt-injected caller passing sessionDir="~/.ssh"
-    // or contentDir="~/.gnupg" would otherwise let the dashboard
-    // enumerate (and, for hex-named SQLite files, mutate rows in) those
-    // directories. Contain explicit overrides to the adapter's config
-    // root: broad enough for the documented "multi-install setups or
-    // pointing at a sibling project's data" use case, narrow enough to
-    // block /etc, ~/.ssh, /tmp/<foreign-user>, etc.
-    if (explicitSessionDir || explicitContentDir) {
-      const defaultSessDir = getSessionDir();
-      const containmentRoot = dirname(dirname(defaultSessDir));
-      const containmentRootWithSep = resolve(containmentRoot) + sep;
-      const isContained = (dir: string): boolean =>
-        (resolve(dir) + sep).startsWith(containmentRootWithSep);
-      if (explicitSessionDir && !isContained(sessDir)) {
-        return trackResponse("ctx_insight", {
-          content: [{
-            type: "text" as const,
-            text: `Error: sessionDir must resolve under ${containmentRoot} (got ${sessDir}).`,
-          }],
-        });
-      }
-      if (explicitContentDir && !isContained(insightContentDirResolved)) {
-        return trackResponse("ctx_insight", {
-          content: [{
-            type: "text" as const,
-            text: `Error: contentDir must resolve under ${containmentRoot} (got ${insightContentDirResolved}).`,
-          }],
-        });
-      }
-    }
-
-    // Verify source exists
-    if (!existsSync(join(insightSource, "server.mjs"))) {
-      return trackResponse("ctx_insight", {
-        content: [{ type: "text" as const, text: "Error: Insight source not found in plugin. Try upgrading context-mode." }],
-      });
-    }
-
-    try {
-      const steps: string[] = [];
-      let sourceUpdated = false;
-
-      // Ensure cache dir
-      mkdirSync(cacheDir, { recursive: true });
-
-      // Copy source files if needed (check by comparing server.mjs mtime)
-      const srcMtime = statSync(join(insightSource, "server.mjs")).mtimeMs;
-      const cacheMtime = existsSync(join(cacheDir, "server.mjs"))
-        ? statSync(join(cacheDir, "server.mjs")).mtimeMs : 0;
-
-      if (srcMtime > cacheMtime) {
-        steps.push("Copying source files...");
-        cpSync(insightSource, cacheDir, { recursive: true, force: true });
-        steps.push("Source files copied.");
-        sourceUpdated = true;
-      }
-
-      // Install deps if needed (also reinstall when source updated and package.json may have changed)
-      const hasNodeModules = existsSync(join(cacheDir, "node_modules"));
-      if (!hasNodeModules || sourceUpdated) {
-        steps.push("Installing dependencies (first run, ~30s)...");
-        try {
-          execSync(process.platform === "win32" ? "npm.cmd install --production=false" : "npm install --production=false", {
-            cwd: cacheDir,
-            stdio: "pipe",
-            timeout: 300000,
-          });
-        } catch {
-          // Clean up partial install so next run retries fresh
-          try { rmSync(join(cacheDir, "node_modules"), { recursive: true, force: true }); } catch {}
-          throw new Error("npm install failed — please retry");
-        }
-        // Sentinel check: verify install completed (cold cache can timeout leaving partial node_modules)
-        if (!existsSync(join(cacheDir, "node_modules", "vite")) || !existsSync(join(cacheDir, "node_modules", "better-sqlite3"))) {
-          rmSync(join(cacheDir, "node_modules"), { recursive: true, force: true });
-          throw new Error("npm install incomplete — please retry");
-        }
-        steps.push("Dependencies installed.");
-      }
-
-      // Build
-      steps.push("Building dashboard...");
-      execSync("npx vite build", {
-        cwd: cacheDir,
-        stdio: "pipe",
-        timeout: 60000,
-      });
-      steps.push("Build complete.");
-
-      // Pre-check: is port already in use?
-      let portOccupied = false;
-      try {
-        const { request } = await import("node:http");
-        await new Promise<void>((resolve, reject) => {
-          const req = request(`http://127.0.0.1:${port}/api/overview`, { timeout: 2000 }, (res) => {
-            res.resume();
-            resolve(); // port is responding = already running
-          });
-          req.on("error", () => reject()); // port free
-          req.on("timeout", () => { req.destroy(); reject(); });
-          req.end();
-        });
-        portOccupied = true;
-      } catch {
-        // Port is free, proceed with spawn
-      }
-
-      if (portOccupied && sourceUpdated) {
-        // Source was updated but stale server is running on port — kill it so fresh code runs
-        steps.push("Killing stale dashboard server (source updated)...");
-        const kill = killProcessOnPort(port);
-        if (kill.attemptedPids.length > 0 && kill.killedPids.length === 0) {
-          // Tried to kill, every attempt failed (perms, race, missing binary).
-          // Surface so the agent doesn't loop on the same port forever.
-          return trackResponse("ctx_insight", {
-            content: [{
-              type: "text" as const,
-              text: `Could not free port ${port} (kill failed for ${kill.attemptedPids.join(", ")}: ${kill.errors.join("; ")}). Try ctx_insight({ port: ${port + 1} }) or stop the process manually.`,
-            }],
-          });
-        }
-        if (kill.errors.length > 0 && kill.attemptedPids.length === 0) {
-          // Couldn't even probe the port (e.g. lsof not installed).
-          return trackResponse("ctx_insight", {
-            content: [{
-              type: "text" as const,
-              text: `Cannot reclaim port ${port}: ${kill.errors.join("; ")}. Stop the process manually or pick another port.`,
-            }],
-          });
-        }
-        await new Promise(r => setTimeout(r, 500)); // Wait for port to free
-        steps.push(`Stale server killed (${kill.killedPids.length} pid${kill.killedPids.length === 1 ? "" : "s"}).`);
-      } else if (portOccupied) {
-        // Source unchanged, server is running fine — just open browser
-        steps.push("Dashboard already running.");
-        const url = `http://localhost:${port}`;
-        const open = openBrowserSync(url);
-        const tail = open.ok
-          ? ""
-          : ` (auto-open failed: ${open.reason}; navigate manually)`;
-        return trackResponse("ctx_insight", {
-          content: [{ type: "text" as const, text: `Dashboard already running at ${url}${tail}` }],
-        });
-      }
-
-      // Kill any previous insight child this MCP spawned (e.g. re-invocation).
-      if (_insightChild && _insightChild.pid && !_insightChild.killed) {
-        try { _insightChild.kill("SIGTERM"); } catch { /* best effort */ }
-      }
-
-      // Start server in background. `detached: true` keeps MCP stdio free, but
-      // we track the handle and kill it in shutdown() so the dashboard does
-      // not orphan when Claude closes. The child also watches INSIGHT_PARENT_PID
-      // as a fallback for SIGKILL/crash paths.
-      const { spawn } = await import("node:child_process");
-      const child = spawn("node", [join(cacheDir, "server.mjs")], {
-        cwd: cacheDir,
-        env: {
-          ...process.env,
-          PORT: String(port),
-          INSIGHT_SESSION_DIR: sessDir,
-          INSIGHT_CONTENT_DIR: insightContentDirResolved,
-          INSIGHT_PARENT_PID: String(process.pid),
-        },
-        detached: true,
-        stdio: "ignore",
-      });
-      child.on("error", () => {}); // prevent unhandled error crash
-      child.unref();
-      _insightChild = child;
-
-      // Wait for server to be ready
-      await new Promise(r => setTimeout(r, 1500));
-
-      // Verify server is actually running
-      try {
-        const { request } = await import("node:http");
-        await new Promise<void>((resolve, reject) => {
-          const req = request(`http://127.0.0.1:${port}/api/overview`, { timeout: 3000 }, (res) => {
-            resolve();
-            res.resume();
-          });
-          req.on("error", reject);
-          req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
-          req.end();
-        });
-      } catch {
-        // Server didn't start — likely port in use
-        return trackResponse("ctx_insight", {
-          content: [{
-            type: "text" as const,
-            text: `Port ${port} appears to be in use. Either a previous dashboard is still running, or another service is using this port.\n\nTo fix:\n- Kill the existing process: ${process.platform === "win32" ? `netstat -ano | findstr :${port}` : `lsof -ti:${port} | xargs kill`}\n- Or use a different port: ctx_insight({ port: ${port + 1} })`,
-          }],
-        });
-      }
-
-      // Open browser (cross-platform)
-      const url = `http://localhost:${port}`;
-      const open = openBrowserSync(url);
-      const openTail = open.ok ? "" : ` (auto-open failed: ${open.reason}; navigate manually)`;
-
-      steps.push(`Dashboard running at ${url}${openTail}`);
-
-      return trackResponse("ctx_insight", {
-        content: [{
-          type: "text" as const,
-          text: steps.map(s => `- ${s}`).join("\n") + `\n\nOpen: ${url}\nPID: ${child.pid} · Stop: ${process.platform === "win32" ? `taskkill /PID ${child.pid} /F` : `kill ${child.pid}`}`,
-        }],
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return trackResponse("ctx_insight", {
-        content: [{ type: "text" as const, text: `Insight setup failed: ${msg}` }],
-      });
-    }
+  async () => {
+    const open = openBrowserSync(INSIGHT_URL);
+    const text = open.ok
+      ? `Opening Insight in your browser: ${INSIGHT_URL}`
+      : `Could not auto-open your browser (${open.reason}).\nOpen Insight manually: ${INSIGHT_URL}`;
+    return trackResponse("ctx_insight", {
+      content: [{ type: "text" as const, text }],
+    });
   },
 );
 
@@ -4817,10 +4589,6 @@ async function main() {
     try { unlinkSync(CM_FS_PRELOAD); } catch { /* best effort */ }
     // Remove MCP readiness sentinel (#230)
     try { unlinkSync(mcpSentinel); } catch { /* best effort */ }
-    // Stop ctx_insight dashboard so it does not outlive Claude.
-    if (_insightChild && _insightChild.pid && !_insightChild.killed) {
-      try { _insightChild.kill("SIGTERM"); } catch { /* best effort */ }
-    }
   };
   const gracefulShutdown = async () => {
     // Final stats flush — bypass throttle so the last 0-500ms of
